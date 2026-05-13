@@ -77,13 +77,15 @@ export default function Home() {
     let API_URL = process.env.NEXT_PUBLIC_API_URL || 
                 (isLocal ? "http://127.0.0.1:8000" : "https://pdf-to-xml-474c.onrender.com");
     
-    // Remove trailing slash if present to prevent double slashes
-    API_URL = API_URL.replace(/\/$/, "");
+    // Strip trailing slash AND any accidentally included endpoint path
+    // This prevents /extract-statement/extract-statement/ double-path 404 errors
+    API_URL = API_URL.replace(/\/+$/, "").replace(/\/extract-statement\/?$/, "");
     
-    console.log("Fetching from:", `${API_URL}/extract-statement/`);
+    const ENDPOINT = `${API_URL}/extract-statement/`;
+    console.log("Fetching from:", ENDPOINT);
 
     try {
-      const res = await fetch(`${API_URL}/extract-statement/`, {
+      const res = await fetch(ENDPOINT, {
         method: "POST", body: formData,
       });
       if (!res.ok) {
