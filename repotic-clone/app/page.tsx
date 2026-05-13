@@ -73,8 +73,12 @@ export default function Home() {
     setTransactions([]);
     const formData = new FormData();
     formData.append("file", file);
+    const isLocal = typeof window !== 'undefined' && window.location.hostname === 'localhost';
+    const API_URL = process.env.NEXT_PUBLIC_API_URL || 
+                    (isLocal ? "http://127.0.0.1:8000" : "https://pdf-to-xml-474c.onrender.com");
+    
     try {
-      const res = await fetch("https://pdf-to-xml-474c.onrender.com/extract-statement/", {
+      const res = await fetch(`${API_URL}/extract-statement/`, {
         method: "POST", body: formData,
       });
       if (!res.ok) {
