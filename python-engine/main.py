@@ -371,35 +371,54 @@ async def extract_statement_xml(file: UploadFile = File(...), password: Optional
     xml = transactions_to_xml(res["data"], file.filename)
     return Response(content=xml, media_type="application/xml", headers={"Content-Disposition": f"attachment; filename=statement.xml"})
 
-# ── Groq AI Parsing Logic ───────────────────────────────────────────────────
+# ── Groq AI Parsing Logic (2-Layer Approach & OCR) ──────────────────────────
 
 import json
+from pdf2image import convert_from_bytes
+import pytesseract
 
-def get_groq_parsing(text_chunk: str, retry: bool = False) -> dict:
+def get_groq_column_mapping(header_row: list, retry: bool = False) -> dict:
     prompt = f"""
-    You are a professional bank statement parser. Analyze the text below from an Indian bank statement 
-    and extract all transaction data into a structured JSON format.
+    You are an expert bank statement parser. Review the following column headers:
+    {json.dumps(header_row)}
+    
+    Determine the 0-based index of the columns corresponding to these roles:
+    - date
+    - narration (or particulars/description)
+    - debit (or withdrawal)
+    - credit (or deposit)
+    - amount (if there is a single amount column instead of separate debit/credit)
+    - balance
+    
+    Return ONLY a JSON object with integer values. If a role is missing, set its value to -1.
+    
+    Example format:
+    {{"date": 0, "narration": 1, "debit": 2, "credit": 3, "amount": -1, "balance": 4}}
+    """
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(completion.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Groq AI Mapping Error: {e}")
+        if not retry:
+            return get_groq_column_mapping(header_row, retry=True)
+        return {"date": -1, "narration": -1, "debit": -1, "credit": -1, "amount": -1, "balance": -1}
 
-    REQUIREMENTS:
-    1. Extract all transactions: Date, Description, Debit, Credit, Balance.
-    2. Return ONLY a valid JSON object. No markdown, no explanations.
-    3. Use keys: "date", "narration", "debit", "credit", "balance".
-    4. Ensure dates are in DD-MM-YYYY format if possible.
-    5. If Debit or Credit is missing, use "0.0".
-
+def get_groq_text_parsing(text_chunk: str, retry: bool = False) -> dict:
+    """Used only as a last resort for OCR text."""
+    prompt = f"""
+    Extract all transaction data from this OCR text of a bank statement into a structured JSON format.
+    Return ONLY a valid JSON object. Use keys: "date", "narration", "debit", "credit", "balance".
+    Ensure dates are DD-MM-YYYY. If missing, use "0.0".
+    
     JSON SCHEMA:
-    {{
-      "Transactions": [
-        {{
-          "date": "",
-          "narration": "",
-          "debit": "0.0",
-          "credit": "0.0",
-          "balance": "0.0"
-        }}
-      ]
-    }}
-
+    {{"Transactions": [{{"date": "", "narration": "", "debit": "0.0", "credit": "0.0", "balance": "0.0"}}]}}
+    
     RAW TEXT:
     {text_chunk}
     """
@@ -412,9 +431,8 @@ def get_groq_parsing(text_chunk: str, retry: bool = False) -> dict:
         )
         return json.loads(completion.choices[0].message.content)
     except Exception as e:
-        logger.error(f"Groq AI Error: {e}")
-        if not retry:
-            return get_groq_parsing(text_chunk, retry=True)
+        logger.error(f"Groq AI Text Error: {e}")
+        if not retry: return get_groq_text_parsing(text_chunk, retry=True)
         return {"Transactions": []}
 
 @app.post("/extract-statement-ai/")
@@ -422,36 +440,67 @@ async def extract_statement_ai(
     file: UploadFile = File(...),
     password: Optional[str] = Form(None),
 ):
-    """
-    AI-powered extraction using Groq (Llama 3.3).
-    Best for complex layouts or unsupported banks.
-    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files supported")
     
     raw = await file.read()
-    # Use existing decryption helper
     contents, is_enc, err = decrypt_pdf(raw, file.filename, password)
     
-    if err == "needs_password":
-        return {"status": "encrypted", "message": "Password required"}
-    if err == "wrong_password":
-        raise HTTPException(status_code=401, detail="Incorrect password")
+    if err == "needs_password": return {"status": "encrypted", "message": "Password required"}
+    if err == "wrong_password": raise HTTPException(status_code=401, detail="Incorrect password")
     
     all_transactions = []
+    has_text = False
     
     with pdfplumber.open(io.BytesIO(contents)) as pdf:
-        text = ""
         for page in pdf.pages:
-            text += page.extract_text() or ""
-            # Chunk every ~2 pages of text (~10k chars)
-            if len(text) > 10000:
-                res = get_groq_parsing(text)
-                all_transactions.extend(res.get("Transactions", []))
-                text = ""
+            if page.extract_text():
+                has_text = True
+                
+            # Try robust table extraction
+            tables = page.extract_tables() or \
+                     page.extract_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"}) or \
+                     page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+            
+            for table in (tables or []):
+                if not table or len(table) < 2: continue
+                
+                # Find header row
+                header_row = []
+                start_idx = 0
+                for i, row in enumerate(table[:10]):
+                    clean_row = [str(c).replace('\n', ' ').strip() for c in row if c]
+                    if len(clean_row) >= 3 and any(kw in str(clean_row).lower() for kw in ['date', 'amount', 'balance', 'particulars']):
+                        header_row = clean_row
+                        start_idx = i + 1
+                        break
+                
+                if header_row:
+                    # Send only header to Groq to map columns
+                    mapping = get_groq_column_mapping(header_row)
+                    if mapping.get("date", -1) != -1:
+                        # Use Python to parse rows
+                        txns = _rows_to_transactions(table, mapping, start_idx)
+                        all_transactions.extend(txns)
+
+    # If standard extraction yielded nothing, and it's a scanned PDF (no text), use OCR + Text Chunking
+    if not all_transactions and not has_text:
+        logger.info("No text/tables found. Falling back to OCR...")
+        images = convert_from_bytes(contents)
+        full_text = ""
+        for img in images:
+            full_text += pytesseract.image_to_string(img) + "\n"
         
-        if text.strip():
-            res = get_groq_parsing(text)
+        # Process OCR text in chunks
+        chunk = ""
+        for line in full_text.split('\n'):
+            chunk += line + "\n"
+            if len(chunk) > 8000:
+                res = get_groq_text_parsing(chunk)
+                all_transactions.extend(res.get("Transactions", []))
+                chunk = ""
+        if chunk.strip():
+            res = get_groq_text_parsing(chunk)
             all_transactions.extend(res.get("Transactions", []))
             
     # Deduplicate
