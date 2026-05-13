@@ -4,7 +4,7 @@ import { useState, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Upload, Download, CheckCircle2, AlertCircle,
-  Database, Building2, FileSpreadsheet,
+  Database, Building2, FileSpreadsheet, Lock, KeyRound,
 } from "lucide-react";
 import Link from "next/link";
 
@@ -59,45 +59,69 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+
+  // ─── Password-protected PDF state ────────────────────────────────────────
+  const [needsPassword, setNeedsPassword] = useState(false);
+  const [pdfPassword, setPdfPassword] = useState("");
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+
   const converterRef = useRef<HTMLDivElement>(null);
 
   const scrollToConverter = () =>
     converterRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setFileName(file.name);
+  // ─── Shared extraction logic ──────────────────────────────────────────────
+  const extractFromFile = async (file: File, password?: string) => {
     setLoading(true);
     setError(null);
     setTransactions([]);
+    setNeedsPassword(false);
+
     const formData = new FormData();
     formData.append("file", file);
-    const isLocal = typeof window !== 'undefined' && window.location.hostname === 'localhost';
-    let API_URL = process.env.NEXT_PUBLIC_API_URL || 
-                (isLocal ? "http://127.0.0.1:8000" : "https://pdf-to-xml-474c.onrender.com");
-    
-    // Strip trailing slash AND any accidentally included endpoint path
-    // This prevents /extract-statement/extract-statement/ double-path 404 errors
+    if (password) formData.append("password", password);
+
+    const isLocal = typeof window !== "undefined" && window.location.hostname === "localhost";
+    let API_URL =
+      process.env.NEXT_PUBLIC_API_URL ||
+      (isLocal ? "http://127.0.0.1:8000" : "https://pdf-to-xml-474c.onrender.com");
     API_URL = API_URL.replace(/\/+$/, "").replace(/\/extract-statement\/?$/, "");
-    
     const ENDPOINT = `${API_URL}/extract-statement/`;
-    console.log("Fetching from:", ENDPOINT);
 
     try {
-      const res = await fetch(ENDPOINT, {
-        method: "POST", body: formData,
-      });
+      const res = await fetch(ENDPOINT, { method: "POST", body: formData });
+
+      // Handle wrong password (HTTP 401)
+      if (res.status === 401) {
+        const err = await res.json().catch(() => ({ detail: "Incorrect password." }));
+        setNeedsPassword(true);   // keep password form visible
+        setPdfPassword("");
+        setError(err.detail || "Incorrect password. Please try again.");
+        return;
+      }
+
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: "Server error" }));
         throw new Error(err.detail || "Backend error");
       }
+
       const result = await res.json();
+
+      // PDF is encrypted — backend needs password
+      if (result.status === "encrypted") {
+        setNeedsPassword(true);
+        setPendingFile(file);
+        setError(null);
+        return;
+      }
+
       if (result.status === "error") throw new Error(result.message || "Extraction failed");
       if (!result.data?.length) {
         setError("No transactions found in this statement.");
       } else {
         setTransactions(result.data);
+        setPendingFile(null);
+        setPdfPassword("");
       }
     } catch (err: any) {
       setError(err.message || "Connection failed. Please check the server.");
@@ -105,6 +129,22 @@ export default function Home() {
       setLoading(false);
     }
   };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setFileName(file.name);
+    setPendingFile(file);
+    setPdfPassword("");
+    setNeedsPassword(false);
+    await extractFromFile(file);
+  };
+
+  const handlePasswordSubmit = async () => {
+    if (!pendingFile || !pdfPassword.trim()) return;
+    await extractFromFile(pendingFile, pdfPassword.trim());
+  };
+
 
   const formatTallyDate = (d: string) => {
     const p = d.split(/[-/.]/);
@@ -210,6 +250,45 @@ export default function Home() {
                   <p className="text-slate-400 font-medium">{loading ? "Identifying transactions..." : "or drag and drop your PDF here"}</p>
                 </div>
               </label>
+
+              <AnimatePresence>
+                {needsPassword && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    className="mt-6 p-6 bg-amber-50 border border-amber-100 rounded-2xl"
+                  >
+                    <div className="flex items-center gap-3 mb-4 text-amber-900 font-bold">
+                      <Lock size={20} className="text-amber-600" />
+                      <span>Password Required</span>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-3">
+                      <div className="relative flex-1">
+                        <KeyRound className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+                        <input 
+                          type="password" 
+                          placeholder="Enter PDF Password"
+                          value={pdfPassword}
+                          onChange={(e) => setPdfPassword(e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && handlePasswordSubmit()}
+                          className="w-full bg-white border border-slate-200 rounded-xl pl-12 pr-4 py-3 font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                      </div>
+                      <button 
+                        onClick={handlePasswordSubmit}
+                        disabled={loading || !pdfPassword.trim()}
+                        className="bg-slate-900 text-white px-8 py-3 rounded-xl font-bold hover:bg-blue-600 disabled:bg-slate-300 transition-all active:scale-95 shadow-lg shadow-slate-200"
+                      >
+                        {loading ? "Decrypting..." : "Unlock & Extract"}
+                      </button>
+                    </div>
+                    <p className="mt-3 text-amber-700/70 text-xs font-semibold px-1">
+                      Bank statements are often protected by your DOB or Account Number.
+                    </p>
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
               <AnimatePresence>
                 {error && (

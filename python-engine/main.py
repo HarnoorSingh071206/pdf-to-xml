@@ -1,11 +1,13 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
+import pikepdf
 import io
 import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import logging
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("repotic-engine")
@@ -368,6 +370,42 @@ def transactions_to_xml(transactions: list, filename: str = "statement") -> str:
     return parsed.toprettyxml(indent="  ", encoding=None)
 
 
+# ── PDF Decryption Helper ────────────────────────────────────────────────────────
+
+def decrypt_pdf(contents: bytes, password: Optional[str] = None) -> tuple:
+    """
+    Returns (decrypted_bytes, is_encrypted, error_message).
+    - If PDF is not encrypted: returns (contents, False, None)
+    - If encrypted + correct password: returns (decrypted_bytes, True, None)
+    - If encrypted + wrong password: returns (None, True, 'wrong_password')
+    - If encrypted + no password: returns (None, True, 'needs_password')
+    """
+    try:
+        # Try opening without password first
+        pdf = pikepdf.open(io.BytesIO(contents))
+        # Not encrypted — return as-is
+        out = io.BytesIO()
+        pdf.save(out)
+        out.seek(0)
+        return out.read(), False, None
+    except pikepdf.PasswordError:
+        pass
+
+    # PDF is encrypted
+    if not password:
+        return None, True, "needs_password"
+
+    try:
+        pdf = pikepdf.open(io.BytesIO(contents), password=password)
+        out = io.BytesIO()
+        pdf.save(out)
+        out.seek(0)
+        logger.info("PDF decrypted successfully")
+        return out.read(), True, None
+    except pikepdf.PasswordError:
+        return None, True, "wrong_password"
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -398,18 +436,31 @@ async def debug_pdf(file: UploadFile = File(...)):
 
 
 @app.post("/extract-statement/")
-async def extract_statement(file: UploadFile = File(...)):
+async def extract_statement(
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+):
     """
     Main endpoint: accepts any bank statement PDF and returns transactions as JSON.
+    Accepts an optional 'password' form field for password-protected PDFs.
     Strategy:
-      1. Try table extraction with cross-page header memory (ICICI, HDFC, Axis, etc.)
-      2. Fall back to line-by-line text parsing (Canara, SBI, etc.)
+      1. Decrypt if needed (pikepdf)
+      2. Try table extraction with cross-page header memory (ICICI, HDFC, Axis, etc.)
+      3. Fall back to line-by-line text parsing (Canara, SBI, etc.)
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    logger.info(f"Processing: {file.filename}")
-    contents = await file.read()
+    logger.info(f"Processing: {file.filename} | password={'yes' if password else 'no'}")
+    raw_contents = await file.read()
+
+    # ── Decrypt if needed ─────────────────────────────────────────────────────
+    contents, is_encrypted, decrypt_err = decrypt_pdf(raw_contents, password)
+    if decrypt_err == "needs_password":
+        return {"status": "encrypted", "message": "This PDF is password-protected. Please enter the password."}
+    if decrypt_err == "wrong_password":
+        raise HTTPException(status_code=401, detail="Incorrect PDF password. Please try again.")
+
     transactions = []
     last_mapping = None  # persisted across pages
 
@@ -473,17 +524,29 @@ async def extract_statement(file: UploadFile = File(...)):
 
 
 @app.post("/extract-statement-xml/")
-async def extract_statement_xml(file: UploadFile = File(...)):
+async def extract_statement_xml(
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+):
     """
     Same as /extract-statement/ but returns the data as an XML file download.
+    Accepts an optional 'password' form field for password-protected PDFs.
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     from fastapi.responses import Response
 
-    logger.info(f"Processing (XML): {file.filename}")
-    contents = await file.read()
+    logger.info(f"Processing (XML): {file.filename} | password={'yes' if password else 'no'}")
+    raw_contents = await file.read()
+
+    # ── Decrypt if needed ─────────────────────────────────────────────────────
+    contents, is_encrypted, decrypt_err = decrypt_pdf(raw_contents, password)
+    if decrypt_err == "needs_password":
+        raise HTTPException(status_code=401, detail="PDF_ENCRYPTED: This PDF is password-protected.")
+    if decrypt_err == "wrong_password":
+        raise HTTPException(status_code=401, detail="Incorrect PDF password. Please try again.")
+
     transactions = []
     last_mapping = None  # persisted across pages
 
