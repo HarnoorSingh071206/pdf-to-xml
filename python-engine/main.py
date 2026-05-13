@@ -28,9 +28,7 @@ def clean_amount(raw) -> float:
     """Clean and parse an amount string that may contain commas, newlines, etc."""
     if not raw:
         return 0.0
-    # Join across newlines (e.g. "1,08,000.\n00" → "1,08,000.00")
     s = str(raw).replace("\n", "").replace("\r", "").strip()
-    # Remove currency symbols
     s = re.sub(r'[₹$£€]', '', s)
     s = s.replace(",", "")
     s = re.sub(r'[^\d.]', '', s)
@@ -50,89 +48,49 @@ MONTH_MAP = {
     'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
 }
 
-# Matches dates like:
-#  01/Apr/2025, 01-Apr-2025, 01 Apr 2025
-#  01/04/2025, 01-04-2025, 2025-04-01
-#  01/Apr/20\n25  (split across cell lines — handled by caller stripping \n)
-
 DATE_PATTERNS = [
-    # DD/Mon/YYYY or DD-Mon-YYYY  (e.g. 01/Apr/2025)
-    re.compile(
-        r'\b(\d{1,2})[/\-\s](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[/\-\s](\d{2,4})\b',
-        re.IGNORECASE
-    ),
-    # DD/MM/YYYY or DD-MM-YYYY
-    re.compile(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b'),
-    # YYYY-MM-DD
-    re.compile(r'\b(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\b'),
-    # DD/MM/YY
-    re.compile(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{2})\b'),
+    # 1. DD/Mon/YYYY or DD.Mon.YYYY
+    re.compile(r'(\d{1,2})[/\-\.\s](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[/\-\.\s](\d{2,4})', re.IGNORECASE),
+    # 2. DD/MM/YYYY or DD.MM.YYYY
+    re.compile(r'(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})'),
+    # 3. YYYY-MM-DD
+    re.compile(r'(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})'),
+    # 4. DD/MM/YY
+    re.compile(r'(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2})'),
 ]
 
 def normalise_date(raw: str) -> str:
-    """
-    Extract and normalise a date from a (possibly multi-line) string.
-    Returns ISO date string 'DD-MM-YYYY' or the raw match if parsing fails.
-    """
-    if not raw:
-        return ""
-    # First: join digit pairs split across lines (e.g. "20\n25" → "2025")
-    # This handles ICICI's Value Date column: "01/Apr/20\n25"
+    if not raw: return ""
+    # Join digit pairs split across lines (e.g. "20\n25" -> "2025")
     text = re.sub(r'(\d)\n(\d)', r'\1\2', str(raw))
-    # Then collapse any remaining newlines to space
+    # Collapse newlines
     text = re.sub(r'[\n\r]+', ' ', text).strip()
-
-    # Pattern 1: DD/Mon/YYYY
-    m = DATE_PATTERNS[0].search(text)
-    if m:
-        day = m.group(1).zfill(2)
-        mon = MONTH_MAP.get(m.group(2).lower(), '00')
-        yr  = m.group(3)
-        if len(yr) == 2:
-            yr = ('20' if int(yr) < 50 else '19') + yr
-        return f"{day}-{mon}-{yr}"
-
-    # Pattern 2: DD/MM/YYYY
-    m = DATE_PATTERNS[1].search(text)
-    if m:
-        day = m.group(1).zfill(2)
-        mon = m.group(2).zfill(2)
-        yr  = m.group(3)
-        return f"{day}-{mon}-{yr}"
-
-    # Pattern 3: YYYY-MM-DD
-    m = DATE_PATTERNS[2].search(text)
-    if m:
-        yr  = m.group(1)
-        mon = m.group(2).zfill(2)
-        day = m.group(3).zfill(2)
-        return f"{day}-{mon}-{yr}"
-
-    # Pattern 4: DD/MM/YY
-    m = DATE_PATTERNS[3].search(text)
-    if m:
-        day = m.group(1).zfill(2)
-        mon = m.group(2).zfill(2)
-        yr  = m.group(3)
-        yr  = ('20' if int(yr) < 50 else '19') + yr
-        return f"{day}-{mon}-{yr}"
-
+    
+    # Try each pattern
+    for i, pattern in enumerate(DATE_PATTERNS):
+        m = pattern.search(text)
+        if m:
+            if i == 0: # DD/Mon/YYYY
+                day = m.group(1).zfill(2)
+                mon = MONTH_MAP.get(m.group(2).lower(), '00')
+                yr  = m.group(3)
+                if len(yr) == 2: yr = ('20' if int(yr) < 50 else '19') + yr
+                return f"{day}-{mon}-{yr}"
+            elif i == 1: # DD/MM/YYYY
+                return f"{m.group(1).zfill(2)}-{m.group(2).zfill(2)}-{m.group(3)}"
+            elif i == 2: # YYYY-MM-DD
+                return f"{m.group(3).zfill(2)}-{m.group(2).zfill(2)}-{m.group(1)}"
+            elif i == 3: # DD/MM/YY
+                day, mon, yr = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+                yr = ('20' if int(yr) < 50 else '19') + yr
+                return f"{day}-{mon}-{yr}"
     return ""
-
-
-def has_date(text: str) -> bool:
-    """Return True if text contains any recognisable date."""
-    return bool(normalise_date(text))
-
 
 # ── Header keyword mapping ──────────────────────────────────────────────────────
 
 HEADER_KWORDS = {
     "date":      ["date", "value date", "txn date", "transaction date", "trans date", "posting date"],
-    # Note: "cheque no" / "ref no" intentionally excluded — they are separate empty columns
-    # in ICICI statements. True narration columns use "remarks", "particulars", "description".
-    "narration": ["particulars", "narration", "description", "remarks", "details",
-                  "transaction remarks", "transaction details"],
+    "narration": ["particulars", "narration", "description", "remarks", "details", "transaction remarks", "transaction details"],
     "debit":     ["debit", "withdrawal", "withdrawals", "dr", "withdra"],
     "credit":    ["credit", "deposit", "deposits", "cr"],
     "amount":    ["amount"],
@@ -148,242 +106,155 @@ def map_header(row: list) -> dict:
                 m[role] = i
     return m
 
-
-# ── Table-based extraction ──────────────────────────────────────────────────────
+# ── Extraction Logic ────────────────────────────────────────────────────────────
 
 def _rows_to_transactions(table: list, mapping: dict, start_row: int = 0) -> list:
-    """
-    Convert table rows to transaction dicts using a pre-discovered column mapping.
-    Handles ICICI-style multi-line cells (years split across lines, etc.).
-    """
     transactions = []
     max_idx = max(v for v in mapping.values() if v != -1)
-
     for row in table[start_row:]:
-        if not row or len(row) <= max_idx:
-            continue
-
-        # --- Date: try primary date column first, then any other date-like column ---
+        if not row or len(row) <= max_idx: continue
         raw_date = str(row[mapping["date"]] or "").strip()
         date_val = normalise_date(raw_date)
-
-        # Fallback: scan OTHER columns in case primary date col is ambiguous
         if not date_val:
             for col_idx, cell in enumerate(row):
-                if col_idx == mapping["date"]:
-                    continue
+                if col_idx == mapping["date"]: continue
                 candidate = normalise_date(str(cell or ""))
                 if candidate:
                     date_val = candidate
                     break
-
-        if not date_val:
-            continue
-
-        # --- Narration ---
-        narration = ""
-        if mapping["narration"] != -1:
-            narration = str(row[mapping["narration"]] or "").replace("\n", " ").strip()
-
-        # --- Debit ---
-        debit = 0.0
-        if mapping["debit"] != -1:
-            debit = clean_amount(row[mapping["debit"]])
-
-        # --- Credit ---
-        credit = 0.0
-        if mapping["credit"] != -1:
-            credit = clean_amount(row[mapping["credit"]])
-
-        # --- Single Amount column ---
+        if not date_val: continue
+        narration = str(row[mapping["narration"]] or "").replace("\n", " ").strip() if mapping["narration"] != -1 else ""
+        debit = clean_amount(row[mapping["debit"]]) if mapping["debit"] != -1 else 0.0
+        credit = clean_amount(row[mapping["credit"]]) if mapping["credit"] != -1 else 0.0
         if mapping["amount"] != -1 and debit == 0.0 and credit == 0.0:
             amt = clean_amount(row[mapping["amount"]])
-            if amt < 0:
-                debit = abs(amt)
-            else:
-                credit = amt
-
-        # --- Balance ---
-        balance = ""
-        if mapping["balance"] != -1:
-            balance = str(row[mapping["balance"]] or "").replace("\n", "").strip()
-            balance = re.sub(r',', '', balance)
-
-        # Skip rows where both debit and credit are zero AND balance is also zero
-        if debit == 0.0 and credit == 0.0:
-            bal_num = clean_amount(balance)
-            if bal_num == 0.0:
-                continue
-
-        transactions.append({
-            "date": date_val,
-            "narration": narration,
-            "debit": str(debit),
-            "credit": str(credit),
-            "balance": balance,
-        })
-
+            if amt < 0: debit = abs(amt)
+            else: credit = amt
+        balance = str(row[mapping["balance"]] or "").replace("\n", "").replace(",", "").strip() if mapping["balance"] != -1 else ""
+        if debit == 0.0 and credit == 0.0 and clean_amount(balance) == 0.0: continue
+        transactions.append({"date": date_val, "narration": narration, "debit": str(debit), "credit": str(credit), "balance": balance})
     return transactions
 
-
 def extract_from_table(table: list, fallback_mapping: dict = None) -> tuple:
-    """
-    Extract transactions from a pdfplumber table.
-    Returns (transactions, mapping) so callers can reuse the mapping on later pages
-    that lack a header row.
-
-    If fallback_mapping is provided and no header is found in this table,
-    it will be used directly (handles ICICI pages 2+).
-    """
-    if not table or len(table) < 1:
-        return [], fallback_mapping
-
-    mapping = None
-    start_row = 0
-
-    # Scan up to the first 15 rows to find the header
+    if not table or len(table) < 1: return [], fallback_mapping
+    mapping, start_row = None, 0
     for i, row in enumerate(table[:15]):
         m = map_header(row)
         if m["date"] != -1 and (m["narration"] != -1 or m["debit"] != -1 or m["amount"] != -1):
-            mapping = m
-            start_row = i + 1
-            logger.info(f"Table header at row {i}: {mapping}")
+            mapping, start_row = m, i + 1
             break
-
     if not mapping:
-        if fallback_mapping:
-            logger.info("No header in this page — reusing mapping from previous page")
-            mapping = fallback_mapping
-            start_row = 0  # all rows are data rows
-        else:
-            logger.info("No header found and no fallback mapping available")
-            return [], None
-
-    txns = _rows_to_transactions(table, mapping, start_row)
-    return txns, mapping
-
-
-# ── Text-based extraction ───────────────────────────────────────────────────────
+        if fallback_mapping: mapping, start_row = fallback_mapping, 0
+        else: return [], None
+    return _rows_to_transactions(table, mapping, start_row), mapping
 
 AMOUNT_RE = re.compile(r'[\d,]+\.\d{2}')
 
 def extract_from_text(page) -> list:
-    """
-    Fallback line-by-line text parser for PDFs that don't have extractable tables.
-    Handles formats: Canara, SBI, HDFC, Axis, etc.
-    """
     text = page.extract_text()
-    if not text:
-        return []
-
-    lines = text.split("\n")
-    transactions = []
-    pending_narration = []
-
+    if not text: return []
+    lines, transactions, pending = text.split("\n"), [], []
     for line in lines:
         line = line.strip()
-        if not line:
-            continue
-
-        date_val = normalise_date(line[:30])
-
+        if not line: continue
+        
+        # 1. Identify date
+        date_match = None
+        date_str = ""
+        for pattern in DATE_PATTERNS:
+            m = pattern.search(line)
+            if m:
+                date_match = m
+                date_str = m.group(0)
+                break
+        
+        date_val = normalise_date(date_str)
+        
         if date_val:
-            amounts = [clean_amount(a) for a in AMOUNT_RE.findall(line)]
+            # Important: Remove the date string from the line before looking for amounts
+            # to avoid misidentifying "01.04.2025" as amount "01.04"
+            line_without_date = line.replace(date_str, " DATE_HERE ")
+            
+            amounts = [clean_amount(a) for a in AMOUNT_RE.findall(line_without_date)]
             if not amounts:
-                pending_narration.append(line)
+                pending.append(line)
                 continue
-
-            # Build narration: everything between the date and the first amount
-            line_no_date = re.sub(DATE_PATTERNS[0].pattern, '', line, flags=re.IGNORECASE)
-            for dp in DATE_PATTERNS[1:]:
-                line_no_date = dp.sub('', line_no_date)
-            narration_part = AMOUNT_RE.sub('', line_no_date).strip()
-            full_narration = " ".join(pending_narration + [narration_part]).strip()
-            pending_narration = []
-
-            balance = amounts[-1]
-
+            
+            # Narration is everything else
+            narration_part = AMOUNT_RE.sub('', line_without_date).replace("DATE_HERE", "").strip()
+            # Clean up S No. or garbage from start
+            narration_part = re.sub(r'^\d+\s+', '', narration_part)
+            
+            full_narration = " ".join(pending + [narration_part]).strip()
+            pending, balance = [], amounts[-1]
+            
             if len(amounts) == 1:
-                continue  # Only balance — opening balance line
+                # Opening balance line usually
+                continue
             elif len(amounts) == 2:
-                txn_amount = amounts[-2]
-                lower_narration = full_narration.lower()
-                credit_keywords = [
-                    "cr", "credit", "deposit", "neft cr", "imps cr",
-                    "by clg", "cash deposit", "inet-imps-cr", "rtgs-cr",
-                    "inward", "received"
-                ]
-                if any(k in lower_narration for k in credit_keywords):
-                    debit, credit = 0.0, txn_amount
-                else:
-                    debit, credit = txn_amount, 0.0
+                amt = amounts[-2]
+                low = full_narration.lower()
+                if any(k in low for k in ["cr", "credit", "deposit", "neft cr", "imps cr", "by clg", "cash deposit", "inet-imps-cr", "rtgs-cr", "inward", "received"]):
+                    debit, credit = 0.0, amt
+                else: debit, credit = amt, 0.0
             elif len(amounts) >= 3:
-                # Three-column format: deposit | withdrawal | balance
-                credit = amounts[-3]
-                debit  = amounts[-2]
-                balance = amounts[-1]
+                # deposit | withdrawal | balance
+                credit, debit, balance = amounts[-3], amounts[-2], amounts[-1]
             else:
                 debit, credit = 0.0, 0.0
-
+                
             transactions.append({
                 "date": date_val,
                 "narration": full_narration,
                 "debit": str(debit),
                 "credit": str(credit),
-                "balance": str(balance),
+                "balance": str(balance)
             })
         else:
-            # Skip obvious header/footer lines
+            # Check if it's a header line to skip
+            low_line = line.lower()
             skip_keywords = [
-                "date", "particulars", "deposits", "withdrawals",
-                "balance", "opening bala", "closing bala", "statement for",
-                "branch", "customer", "product", "address", "phone", "ifsc",
-                "account no", "pan", "page", "continued", "sl no", "sr no",
-                "tran id", "cheque", "value date",
+                "date", "particulars", "deposits", "withdrawals", "balance", 
+                "opening bala", "closing bala", "statement for", "branch", 
+                "customer", "product", "address", "phone", "ifsc", "account no", 
+                "pan", "page", "continued", "sl no", "sr no", "tran id", "cheque", 
+                "value date", "transactions in", "saving account", "period",
+                "base branch", "delhi", "india", "dl, in"
             ]
-            if any(kw in line.lower() for kw in skip_keywords):
+            if any(kw in low_line for kw in skip_keywords):
+                # If we find a header-like line, clear pending to avoid it bleeding into next txn
+                pending = []
                 continue
-            pending_narration.append(line)
-
+            
+            # Limit pending buffer to 5 lines to avoid ancient headers sticking around
+            if len(pending) > 5:
+                pending = pending[-5:]
+                
+            pending.append(line)
     return transactions
 
-
-# ── XML Builder ─────────────────────────────────────────────────────────────────
-
 def transactions_to_xml(transactions: list, filename: str = "statement") -> str:
-    """Convert list of transaction dicts to a formatted XML string."""
     root = ET.Element("BankStatement")
     root.set("source", filename)
     root.set("totalTransactions", str(len(transactions)))
-
     for i, txn in enumerate(transactions, 1):
         t = ET.SubElement(root, "Transaction")
         t.set("id", str(i))
-
         for field in ["date", "narration", "debit", "credit", "balance"]:
-            el = ET.SubElement(t, field.capitalize())
-            el.text = str(txn.get(field, ""))
-
-    # Pretty-print
+            ET.SubElement(t, field.capitalize()).text = str(txn.get(field, ""))
     raw_xml = ET.tostring(root, encoding="unicode")
-    parsed = minidom.parseString(raw_xml)
-    return parsed.toprettyxml(indent="  ", encoding=None)
+    return minidom.parseString(raw_xml).toprettyxml(indent="  ", encoding=None)
 
+# ── PDF Decryption Helper with Auto-Unlock ──────────────────────────────────────
 
-# ── PDF Decryption Helper ────────────────────────────────────────────────────────
-
-def decrypt_pdf(contents: bytes, password: Optional[str] = None) -> tuple:
+def decrypt_pdf(contents: bytes, filename: str, password: Optional[str] = None) -> tuple:
     """
     Returns (decrypted_bytes, is_encrypted, error_message).
-    - If PDF is not encrypted: returns (contents, False, None)
-    - If encrypted + correct password: returns (decrypted_bytes, True, None)
-    - If encrypted + wrong password: returns (None, True, 'wrong_password')
-    - If encrypted + no password: returns (None, True, 'needs_password')
+    Now includes 'Auto-Unlock' logic to try simple passwords silently.
     """
     try:
-        # Try opening without password first
+        # 1. Try opening without password first
         pdf = pikepdf.open(io.BytesIO(contents))
-        # Not encrypted — return as-is
         out = io.BytesIO()
         pdf.save(out)
         out.seek(0)
@@ -391,207 +262,99 @@ def decrypt_pdf(contents: bytes, password: Optional[str] = None) -> tuple:
     except pikepdf.PasswordError:
         pass
 
-    # PDF is encrypted
-    if not password:
-        return None, True, "needs_password"
+    # 2. If user provided a password, try it
+    if password:
+        try:
+            pdf = pikepdf.open(io.BytesIO(contents), password=password)
+            out = io.BytesIO()
+            pdf.save(out)
+            out.seek(0)
+            return out.read(), True, None
+        except pikepdf.PasswordError:
+            return None, True, "wrong_password"
 
-    try:
-        pdf = pikepdf.open(io.BytesIO(contents), password=password)
-        out = io.BytesIO()
-        pdf.save(out)
-        out.seek(0)
-        logger.info("PDF decrypted successfully")
-        return out.read(), True, None
-    except pikepdf.PasswordError:
-        return None, True, "wrong_password"
+    # 3. AUTO-UNLOCK: Try smart guesses and brute-force
+    logger.info(f"Attempting Auto-Unlock for {filename}...")
+    import time
+    start = time.time()
+    
+    # Strategy A: Guesses from Filename
+    guesses = set(re.findall(r'\d{4,}', filename)) # Long numbers in filename
+    # Add common patterns
+    guesses.update(["1234", "0000", "1111", "admin", "password"])
+    
+    for g in guesses:
+        try:
+            pdf = pikepdf.open(io.BytesIO(contents), password=g)
+            out = io.BytesIO()
+            pdf.save(out)
+            out.seek(0)
+            logger.info(f"Auto-unlocked with guess: {g}")
+            return out.read(), True, None
+        except pikepdf.PasswordError:
+            continue
 
+    # Strategy B: 4-digit PIN brute-force (0000-9999)
+    logger.info("Starting 4-digit brute-force...")
+    pdf_io = io.BytesIO(contents)
+    for i in range(10000):
+        pin = str(i).zfill(4)
+        try:
+            pdf_io.seek(0)
+            pdf = pikepdf.open(pdf_io, password=pin)
+            out = io.BytesIO()
+            pdf.save(out)
+            out.seek(0)
+            logger.info(f"Auto-unlocked with PIN: {pin} in {time.time() - start:.2f}s")
+            return out.read(), True, None
+        except pikepdf.PasswordError:
+            continue
+        if i % 2000 == 0: logger.info(f"Tried {i} pins...")
+
+    logger.info(f"Auto-unlock failed after {time.time() - start:.2f}s")
+    return None, True, "needs_password"
 
 # ── Endpoints ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
-async def health():
-    return {"status": "online"}
-
-
-@app.post("/debug-pdf/")
-async def debug_pdf(file: UploadFile = File(...)):
-    """Returns raw structure of the first 3 pages for debugging."""
-    contents = await file.read()
-    result = {"pages": []}
-    with pdfplumber.open(io.BytesIO(contents)) as pdf:
-        for i, page in enumerate(pdf.pages[:3]):
-            tables = page.extract_tables()
-            text = (page.extract_text() or "")[:1000]
-            sample_table = []
-            if tables:
-                for row in tables[0][:5]:
-                    sample_table.append([str(c or '') for c in row])
-            result["pages"].append({
-                "page": i + 1,
-                "tables_found": len(tables),
-                "table_row_sample": sample_table,
-                "text_snippet": text,
-            })
-    return result
-
+async def health(): return {"status": "online"}
 
 @app.post("/extract-statement/")
-async def extract_statement(
-    file: UploadFile = File(...),
-    password: Optional[str] = Form(None),
-):
-    """
-    Main endpoint: accepts any bank statement PDF and returns transactions as JSON.
-    Accepts an optional 'password' form field for password-protected PDFs.
-    Strategy:
-      1. Decrypt if needed (pikepdf)
-      2. Try table extraction with cross-page header memory (ICICI, HDFC, Axis, etc.)
-      3. Fall back to line-by-line text parsing (Canara, SBI, etc.)
-    """
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-    logger.info(f"Processing: {file.filename} | password={'yes' if password else 'no'}")
-    raw_contents = await file.read()
-
-    # ── Decrypt if needed ─────────────────────────────────────────────────────
-    contents, is_encrypted, decrypt_err = decrypt_pdf(raw_contents, password)
-    if decrypt_err == "needs_password":
-        return {"status": "encrypted", "message": "This PDF is password-protected. Please enter the password."}
-    if decrypt_err == "wrong_password":
-        raise HTTPException(status_code=401, detail="Incorrect PDF password. Please try again.")
-
-    transactions = []
-    last_mapping = None  # persisted across pages
-
+async def extract_statement(file: UploadFile = File(...), password: Optional[str] = Form(None)):
+    if not file.filename.lower().endswith(".pdf"): raise HTTPException(status_code=400, detail="Only PDF files supported")
+    raw = await file.read()
+    contents, is_enc, err = decrypt_pdf(raw, file.filename, password)
+    if err == "needs_password": return {"status": "encrypted", "message": "Password required"}
+    if err == "wrong_password": raise HTTPException(status_code=401, detail="Incorrect password")
+    
+    transactions, last_mapping = [], None
     with pdfplumber.open(io.BytesIO(contents)) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            logger.info(f"=== Page {page_num + 1} ===")
-
+        for page in pdf.pages:
             page_txns = []
-
-            # ── Step 1: Try table extraction ──────────────────────────────────
-            tables = page.extract_tables()
-            if not tables:
-                tables = page.extract_tables(
-                    table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"}
-                )
-            if not tables:
-                tables = page.extract_tables(
-                    table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"}
-                )
-
-            for table in tables:
-                # Pass last_mapping so headerless pages (ICICI p2+) still parse
-                tbl_txns, discovered_mapping = extract_from_table(table, fallback_mapping=last_mapping)
-                if discovered_mapping:
-                    last_mapping = discovered_mapping  # remember for next pages
-                if tbl_txns:
-                    page_txns.extend(tbl_txns)
-                    logger.info(f"  Table parsing: {len(tbl_txns)} transactions")
-
-            # ── Step 2: If tables gave nothing, use text parsing ──────────────
-            if not page_txns:
-                text_txns = extract_from_text(page)
-                if text_txns:
-                    page_txns.extend(text_txns)
-                    logger.info(f"  Text parsing: {len(text_txns)} transactions")
-
+            tables = page.extract_tables() or page.extract_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"}) or page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+            for table in (tables or []):
+                tbl_txns, m = extract_from_table(table, last_mapping)
+                if m: last_mapping = m
+                if tbl_txns: page_txns.extend(tbl_txns)
+            if not page_txns: page_txns.extend(extract_from_text(page))
             transactions.extend(page_txns)
-
-    # Deduplicate (same date + narration + amount)
+    
     seen = set()
-    unique_txns = []
-    for txn in transactions:
-        key = (txn["date"], txn["narration"][:40], txn["debit"], txn["credit"])
-        if key not in seen:
-            seen.add(key)
-            unique_txns.append(txn)
-
-    logger.info(f"Total unique transactions: {len(unique_txns)}")
-
-    if not unique_txns:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "No transactions could be extracted from this PDF. "
-                "The file may be scanned/image-based, password-protected, or in an unsupported format. "
-                "Please use /debug-pdf/ to inspect the raw structure."
-            )
-        )
-
-    return {"status": "success", "data": unique_txns}
-
+    unique = []
+    for t in transactions:
+        k = (t["date"], t["narration"][:40], t["debit"], t["credit"])
+        if k not in seen:
+            seen.add(k)
+            unique.append(t)
+    
+    if not unique: raise HTTPException(status_code=422, detail="No transactions found")
+    return {"status": "success", "data": unique}
 
 @app.post("/extract-statement-xml/")
-async def extract_statement_xml(
-    file: UploadFile = File(...),
-    password: Optional[str] = Form(None),
-):
-    """
-    Same as /extract-statement/ but returns the data as an XML file download.
-    Accepts an optional 'password' form field for password-protected PDFs.
-    """
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
+async def extract_statement_xml(file: UploadFile = File(...), password: Optional[str] = Form(None)):
     from fastapi.responses import Response
-
-    logger.info(f"Processing (XML): {file.filename} | password={'yes' if password else 'no'}")
-    raw_contents = await file.read()
-
-    # ── Decrypt if needed ─────────────────────────────────────────────────────
-    contents, is_encrypted, decrypt_err = decrypt_pdf(raw_contents, password)
-    if decrypt_err == "needs_password":
-        raise HTTPException(status_code=401, detail="PDF_ENCRYPTED: This PDF is password-protected.")
-    if decrypt_err == "wrong_password":
-        raise HTTPException(status_code=401, detail="Incorrect PDF password. Please try again.")
-
-    transactions = []
-    last_mapping = None  # persisted across pages
-
-    with pdfplumber.open(io.BytesIO(contents)) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            page_txns = []
-
-            tables = page.extract_tables()
-            if not tables:
-                tables = page.extract_tables(
-                    table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"}
-                )
-            if not tables:
-                tables = page.extract_tables(
-                    table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"}
-                )
-
-            for table in tables:
-                tbl_txns, discovered_mapping = extract_from_table(table, fallback_mapping=last_mapping)
-                if discovered_mapping:
-                    last_mapping = discovered_mapping
-                if tbl_txns:
-                    page_txns.extend(tbl_txns)
-
-            if not page_txns:
-                text_txns = extract_from_text(page)
-                page_txns.extend(text_txns)
-
-            transactions.extend(page_txns)
-
-    seen = set()
-    unique_txns = []
-    for txn in transactions:
-        key = (txn["date"], txn["narration"][:40], txn["debit"], txn["credit"])
-        if key not in seen:
-            seen.add(key)
-            unique_txns.append(txn)
-
-    if not unique_txns:
-        raise HTTPException(status_code=422, detail="No transactions found in this PDF.")
-
-    xml_str = transactions_to_xml(unique_txns, filename=file.filename)
-
-    return Response(
-        content=xml_str,
-        media_type="application/xml",
-        headers={"Content-Disposition": f"attachment; filename=statement.xml"}
-    )
+    res = await extract_statement(file, password)
+    if isinstance(res, dict) and res.get("status") == "encrypted":
+         raise HTTPException(status_code=401, detail="PDF_ENCRYPTED")
+    xml = transactions_to_xml(res["data"], file.filename)
+    return Response(content=xml, media_type="application/xml", headers={"Content-Disposition": f"attachment; filename=statement.xml"})
