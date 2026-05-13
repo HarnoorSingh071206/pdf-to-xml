@@ -8,6 +8,12 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import logging
 from typing import Optional
+from groq import Groq
+from dotenv import load_dotenv
+import os
+
+load_dotenv() # Load from root .env
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("repotic-engine")
@@ -213,16 +219,19 @@ def extract_from_text(page) -> list:
         else:
             # Check if it's a header line to skip
             low_line = line.lower()
+            # Only skip lines that look like structural headers, not just containing common words
             skip_keywords = [
                 "date", "particulars", "deposits", "withdrawals", "balance", 
-                "opening bala", "closing bala", "statement for", "branch", 
-                "customer", "product", "address", "phone", "ifsc", "account no", 
+                "opening bala", "closing bala", "statement for", 
+                "customer id", "product", "phone", "ifsc", "account no", 
                 "pan", "page", "continued", "sl no", "sr no", "tran id", "cheque", 
-                "value date", "transactions in", "saving account", "period",
-                "base branch", "delhi", "india", "dl, in"
+                "value date", "transactions in", "saving account",
+                "base branch"
             ]
-            if any(kw in low_line for kw in skip_keywords):
-                # If we find a header-like line, clear pending to avoid it bleeding into next txn
+            
+            # More specific header check: skip if line IS one of these or starts with them
+            is_header = any(line.strip().lower().startswith(kw) for kw in skip_keywords)
+            if is_header:
                 pending = []
                 continue
             
@@ -294,24 +303,19 @@ def decrypt_pdf(contents: bytes, filename: str, password: Optional[str] = None) 
         except pikepdf.PasswordError:
             continue
 
-    # Strategy B: 4-digit PIN brute-force (0000-9999)
-    logger.info("Starting 4-digit brute-force...")
-    pdf_io = io.BytesIO(contents)
-    for i in range(10000):
-        pin = str(i).zfill(4)
+    # Strategy B: Common Defaults (Fast)
+    for g in ["1234", "0000", "1111", "admin", "password"]:
         try:
-            pdf_io.seek(0)
-            pdf = pikepdf.open(pdf_io, password=pin)
+            pdf = pikepdf.open(io.BytesIO(contents), password=g)
             out = io.BytesIO()
             pdf.save(out)
             out.seek(0)
-            logger.info(f"Auto-unlocked with PIN: {pin} in {time.time() - start:.2f}s")
+            logger.info(f"Auto-unlocked with common guess: {g}")
             return out.read(), True, None
         except pikepdf.PasswordError:
             continue
-        if i % 2000 == 0: logger.info(f"Tried {i} pins...")
 
-    logger.info(f"Auto-unlock failed after {time.time() - start:.2f}s")
+    logger.info("Auto-unlock failed. Requesting password from user.")
     return None, True, "needs_password"
 
 # ── Endpoints ───────────────────────────────────────────────────────────────────
@@ -331,12 +335,22 @@ async def extract_statement(file: UploadFile = File(...), password: Optional[str
     with pdfplumber.open(io.BytesIO(contents)) as pdf:
         for page in pdf.pages:
             page_txns = []
-            tables = page.extract_tables() or page.extract_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"}) or page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
-            for table in (tables or []):
-                tbl_txns, m = extract_from_table(table, last_mapping)
-                if m: last_mapping = m
-                if tbl_txns: page_txns.extend(tbl_txns)
-            if not page_txns: page_txns.extend(extract_from_text(page))
+            # Try extraction once with a balanced setting. 
+            # Sequential 'or' with empty lists caused triple-processing before.
+            tables = page.extract_tables()
+            if not tables:
+                # Fallback to text parsing if no tables found
+                page_txns.extend(extract_from_text(page))
+            else:
+                for table in tables:
+                    tbl_txns, m = extract_from_table(table, last_mapping)
+                    if m: last_mapping = m
+                    if tbl_txns: page_txns.extend(tbl_txns)
+                
+                # If table extraction was found but returned no transactions, try text fallback
+                if not page_txns:
+                    page_txns.extend(extract_from_text(page))
+            
             transactions.extend(page_txns)
     
     seen = set()
@@ -358,3 +372,100 @@ async def extract_statement_xml(file: UploadFile = File(...), password: Optional
          raise HTTPException(status_code=401, detail="PDF_ENCRYPTED")
     xml = transactions_to_xml(res["data"], file.filename)
     return Response(content=xml, media_type="application/xml", headers={"Content-Disposition": f"attachment; filename=statement.xml"})
+
+# ── Groq AI Parsing Logic ───────────────────────────────────────────────────
+
+import json
+
+def get_groq_parsing(text_chunk: str, retry: bool = False) -> dict:
+    prompt = f"""
+    You are a professional bank statement parser. Analyze the text below from an Indian bank statement 
+    and extract all transaction data into a structured JSON format.
+
+    REQUIREMENTS:
+    1. Extract all transactions: Date, Description, Debit, Credit, Balance.
+    2. Return ONLY a valid JSON object. No markdown, no explanations.
+    3. Use keys: "date", "narration", "debit", "credit", "balance".
+    4. Ensure dates are in DD-MM-YYYY format if possible.
+    5. If Debit or Credit is missing, use "0.0".
+
+    JSON SCHEMA:
+    {{
+      "Transactions": [
+        {{
+          "date": "",
+          "narration": "",
+          "debit": "0.0",
+          "credit": "0.0",
+          "balance": "0.0"
+        }}
+      ]
+    }}
+
+    RAW TEXT:
+    {text_chunk}
+    """
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(completion.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Groq AI Error: {e}")
+        if not retry:
+            return get_groq_parsing(text_chunk, retry=True)
+        return {"Transactions": []}
+
+@app.post("/extract-statement-ai/")
+async def extract_statement_ai(
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+):
+    """
+    AI-powered extraction using Groq (Llama 3.3).
+    Best for complex layouts or unsupported banks.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files supported")
+    
+    raw = await file.read()
+    # Use existing decryption helper
+    contents, is_enc, err = decrypt_pdf(raw, file.filename, password)
+    
+    if err == "needs_password":
+        return {"status": "encrypted", "message": "Password required"}
+    if err == "wrong_password":
+        raise HTTPException(status_code=401, detail="Incorrect password")
+    
+    all_transactions = []
+    
+    with pdfplumber.open(io.BytesIO(contents)) as pdf:
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+            # Chunk every ~2 pages of text (~10k chars)
+            if len(text) > 10000:
+                res = get_groq_parsing(text)
+                all_transactions.extend(res.get("Transactions", []))
+                text = ""
+        
+        if text.strip():
+            res = get_groq_parsing(text)
+            all_transactions.extend(res.get("Transactions", []))
+            
+    # Deduplicate
+    seen = set()
+    unique = []
+    for t in all_transactions:
+        k = (str(t.get("date")), str(t.get("narration"))[:40], str(t.get("debit")), str(t.get("credit")))
+        if k not in seen:
+            seen.add(k)
+            unique.append(t)
+            
+    if not unique:
+        raise HTTPException(status_code=422, detail="AI could not extract any transactions.")
+        
+    return {"status": "success", "data": unique}
