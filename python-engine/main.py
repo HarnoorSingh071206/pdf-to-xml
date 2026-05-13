@@ -335,21 +335,19 @@ async def extract_statement(file: UploadFile = File(...), password: Optional[str
     with pdfplumber.open(io.BytesIO(contents)) as pdf:
         for page in pdf.pages:
             page_txns = []
-            # Try extraction once with a balanced setting. 
-            # Sequential 'or' with empty lists caused triple-processing before.
-            tables = page.extract_tables()
-            if not tables:
-                # Fallback to text parsing if no tables found
+            # Try multiple table extraction strategies for maximum compatibility
+            tables = page.extract_tables() or \
+                     page.extract_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"}) or \
+                     page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+            
+            for table in (tables or []):
+                tbl_txns, m = extract_from_table(table, last_mapping)
+                if m: last_mapping = m
+                if tbl_txns: page_txns.extend(tbl_txns)
+            
+            # If table extraction was found but returned no transactions (or no tables found), try text fallback
+            if not page_txns:
                 page_txns.extend(extract_from_text(page))
-            else:
-                for table in tables:
-                    tbl_txns, m = extract_from_table(table, last_mapping)
-                    if m: last_mapping = m
-                    if tbl_txns: page_txns.extend(tbl_txns)
-                
-                # If table extraction was found but returned no transactions, try text fallback
-                if not page_txns:
-                    page_txns.extend(extract_from_text(page))
             
             transactions.extend(page_txns)
     
