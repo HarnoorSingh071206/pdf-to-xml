@@ -59,6 +59,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [useAI, setUseAI] = useState(false); // New AI Toggle State
 
   // ─── Password-protected PDF state ────────────────────────────────────────
   const [needsPassword, setNeedsPassword] = useState(false);
@@ -85,8 +86,12 @@ export default function Home() {
     let API_URL =
       process.env.NEXT_PUBLIC_API_URL ||
       (isLocal ? "http://127.0.0.1:8000" : "https://pdf-to-xml-474c.onrender.com");
-    API_URL = API_URL.replace(/\/+$/, "").replace(/\/extract-statement\/?$/, "");
-    const ENDPOINT = `${API_URL}/extract-statement/`;
+    API_URL = API_URL.replace(/\/+$/, "");
+    
+    // Switch endpoint based on useAI state
+    const ENDPOINT = useAI 
+      ? `${API_URL}/extract-statement-ai/`
+      : `${API_URL}/extract-statement/`;
 
     try {
       const res = await fetch(ENDPOINT, { method: "POST", body: formData });
@@ -247,9 +252,28 @@ export default function Home() {
                 </div>
                 <div className="text-center">
                   <p className="text-xl font-bold text-slate-900 mb-1">{loading ? "Processing..." : fileName ? fileName : "Choose Bank Statement"}</p>
-                  <p className="text-slate-400 font-medium">{loading ? "Identifying transactions..." : "or drag and drop your PDF here"}</p>
+                  <p className="text-slate-400 font-medium">{loading ? (useAI ? "Gemini 2.5 Flash is thinking..." : "Identifying transactions...") : "or drag and drop your PDF here"}</p>
                 </div>
               </label>
+
+              {/* ── AI Toggle ── */}
+              <div className="mt-6 flex items-center justify-between p-4 bg-blue-50/30 rounded-2xl border border-blue-100">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white">
+                    <Database size={20} className={useAI ? "animate-pulse" : ""} />
+                  </div>
+                  <div>
+                    <p className="font-bold text-slate-900 text-sm">AI Powered Engine (Gemini)</p>
+                    <p className="text-slate-500 text-xs font-medium">Use Gemini 2.5 Flash for complex statement layouts</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setUseAI(!useAI)}
+                  className={`relative w-14 h-8 rounded-full transition-all duration-300 ${useAI ? "bg-blue-600" : "bg-slate-200"}`}
+                >
+                  <div className={`absolute top-1 left-1 w-6 h-6 bg-white rounded-full transition-all duration-300 shadow-sm ${useAI ? "translate-x-6" : ""}`} />
+                </button>
+              </div>
 
               <AnimatePresence>
                 {needsPassword && (
