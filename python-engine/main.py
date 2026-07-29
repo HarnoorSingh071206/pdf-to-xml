@@ -169,13 +169,20 @@ def detect_columns(headers: List[str]) -> Dict[str, int]:
 def reconcile_and_fix_transactions(transactions: List[Dict]) -> List[Dict]:
     """
     THE CRITICAL FIX: Validate every transaction using balance math.
-    If Previous Balance - Debit + Credit != Current Balance, we KNOW something is wrong.
+    Strategy (in priority order):
+      1. If debit/credit are swapped → swap them.
+      2. If reclassifying fixes the balance → reclassify.
+      3. AUTHORITATIVE FALLBACK: derive debit/credit from the balance delta.
+         balance_delta = curr_bal - prev_bal
+         If delta < 0  → it was a debit  (money went OUT)
+         If delta >= 0 → it was a credit (money came IN)
+         The balance column is a single number — much harder for Gemini to
+         misread than the separate debit/credit columns.
     """
     if len(transactions) < 2:
         return transactions
     
     fixed_transactions = []
-    error_log = []
     
     for i, txn in enumerate(transactions):
         if i == 0:
@@ -197,53 +204,63 @@ def reconcile_and_fix_transactions(transactions: List[Dict]) -> List[Dict]:
             debit = clean_amount(txn.get("debit", "0"))
             credit = clean_amount(txn.get("credit", "0"))
             
-            # THE MATH CHECK
             expected_balance = prev_bal - debit + credit
             
-            if abs(expected_balance - curr_bal) > Decimal('0.01'):
-                # BALANCE MISMATCH DETECTED!
-                logger.warning(f"Row {i}: Balance mismatch! Expected {expected_balance}, got {curr_bal}")
-                
-                # TRY FIX #1: Maybe debit and credit are swapped?
-                expected_swapped = prev_bal - credit + debit
-                if abs(expected_swapped - curr_bal) < Decimal('0.01'):
-                    logger.info(f"Row {i}: Auto-fixed by swapping debit/credit")
-                    txn["debit"], txn["credit"] = str(credit), str(debit)
-                
-                # TRY FIX #2: Maybe the amount column sign convention is wrong
-                elif abs(prev_bal + debit - curr_bal) < Decimal('0.01'):
-                    logger.info(f"Row {i}: Auto-fixed by negating debit")
-                    txn["debit"] = str(-debit)
-                elif abs(prev_bal - credit - curr_bal) < Decimal('0.01'):
-                    logger.info(f"Row {i}: Auto-fixed by negating credit")
-                    txn["credit"] = str(-credit)
-                
-                # TRY FIX #3: Check if this row is a duplicate
-                elif i > 0:
-                    prev_txn = transactions[i-1]
-                    if (prev_txn.get("date") == txn.get("date") and 
-                        prev_txn.get("narration")[:20] == txn.get("narration")[:20] and
-                        abs(clean_amount(prev_txn.get("debit", "0")) - debit) < Decimal('0.01') and
-                        abs(clean_amount(prev_txn.get("credit", "0")) - credit) < Decimal('0.01')):
-                        logger.warning(f"Row {i}: Skipping duplicate transaction")
-                        continue  # Skip this duplicate
-                
+            if abs(expected_balance - curr_bal) <= Decimal('0.01'):
+                # ✅ Math checks out
+                fixed_transactions.append(txn)
+                continue
+            
+            # BALANCE MISMATCH DETECTED
+            logger.warning(f"Row {i}: Balance mismatch! Expected {expected_balance}, got {curr_bal}")
+            fixed_this_row = False
+            
+            # FIX #1: Maybe debit and credit are swapped?
+            expected_swapped = prev_bal - credit + debit
+            if abs(expected_swapped - curr_bal) <= Decimal('0.01'):
+                logger.info(f"Row {i}: FIX #1 — swapped debit/credit")
+                txn["debit"], txn["credit"] = str(credit), str(debit)
+                fixed_this_row = True
+            
+            # FIX #2a: Reclassify debit-only as credit
+            elif debit > 0 and credit == Decimal('0.00'):
+                if abs((prev_bal + debit) - curr_bal) <= Decimal('0.01'):
+                    logger.info(f"Row {i}: FIX #2a — debit→credit")
+                    txn["credit"] = str(debit)
+                    txn["debit"] = "0.00"
+                    fixed_this_row = True
+            
+            # FIX #2b: Reclassify credit-only as debit
+            elif credit > 0 and debit == Decimal('0.00'):
+                if abs((prev_bal - credit) - curr_bal) <= Decimal('0.01'):
+                    logger.info(f"Row {i}: FIX #2b — credit→debit")
+                    txn["debit"] = str(credit)
+                    txn["credit"] = "0.00"
+                    fixed_this_row = True
+            
+            # FIX #3 (AUTHORITATIVE FALLBACK): Derive from balance delta
+            if not fixed_this_row:
+                balance_delta = curr_bal - prev_bal
+                if balance_delta < Decimal('0.00'):
+                    correct_debit = abs(balance_delta)
+                    logger.info(f"Row {i}: FIX #3 — delta {balance_delta} → debit={correct_debit} (was debit={debit}, credit={credit})")
+                    txn["debit"] = str(correct_debit)
+                    txn["credit"] = "0.00"
+                elif balance_delta > Decimal('0.00'):
+                    correct_credit = balance_delta
+                    logger.info(f"Row {i}: FIX #3 — delta +{balance_delta} → credit={correct_credit} (was debit={debit}, credit={credit})")
+                    txn["credit"] = str(correct_credit)
+                    txn["debit"] = "0.00"
                 else:
-                    error_log.append({
-                        "row": i,
-                        "expected_balance": str(expected_balance),
-                        "actual_balance": str(curr_balance),
-                        "transaction": txn
-                    })
+                    logger.info(f"Row {i}: FIX #3 — zero delta → debit=0.00 credit=0.00")
+                    txn["debit"] = "0.00"
+                    txn["credit"] = "0.00"
             
             fixed_transactions.append(txn)
             
         except Exception as e:
             logger.error(f"Error reconciling row {i}: {e}")
             fixed_transactions.append(txn)
-    
-    if error_log:
-        logger.warning(f"Found {len(error_log)} unreconciled transactions")
     
     return fixed_transactions
 
@@ -548,43 +565,58 @@ async def extract_statement_ai(
         if uploaded_file.state.name == "FAILED":
             raise HTTPException(status_code=500, detail="Gemini failed to process document")
         
-        # Enhanced prompt with explicit debit/credit rules
-        prompt = """
-        You are a professional bank statement parser. Extract ALL transactions from this PDF.
+        # Precision-focused prompt with Indian number format awareness
+        prompt = """You are an expert Indian bank statement parser. Extract ALL transactions from this PDF with EXTREME PRECISION on all monetary amounts.
 
-        CRITICAL RULES:
-        1. Date format: DD-MM-YYYY
-        2. Extract cheque_number or reference number from a dedicated column, or from within the narration text.
-        3. Debit means money OUT (withdrawal, payment)
-        4. Credit means money IN (deposit, receipt)
-        5. Balance = Previous Balance - Debit + Credit
-        6. If a row has both Debit and Credit columns, use the non-empty one
-        7. If only one amount column exists, check transaction description:
-           - Words like "NEFT CR", "IMPS CR", "BY CLG", "DEPOSIT" = Credit
-           - Words like "NEFT DR", "IMPS DR", "PAYMENT", "WITHDRAWAL" = Debit
-        8. Include opening balance as first row if present
-        9. Do NOT skip any transaction
-        10. If balance column is empty, calculate it
-        11. Return ONLY valid JSON
+CRITICAL RULES FOR AMOUNTS:
+1. Indian bank statements use the Indian numbering system: 1,23,456.78 means ONE LAKH TWENTY-THREE THOUSAND = 123456.78 as a plain number. The LAST decimal group after the final dot is paise.
+2. EXACT DECIMAL RULE: "2,12,542.14" → 212542.14. "1,15,935.00" → 115935.00. NEVER drop or shift the decimal point.
+3. A number like "2,12,542" has NO decimal — it is 212542.00. Add ".00" yourself.
+4. ZERO-INFLATION RULE: if your extracted balance is 10× or 100× larger than neighbouring balances, you have misread a comma as a decimal — go back and re-read.
+5. EVERY amount MUST be returned as a plain decimal STRING with exactly 2 decimal places: "115935.00", "2008.28". No commas, no ₹ symbol.
+6. If an amount cell is blank or has a dash (-), return "0.00".
+7. Opening Balance row: debit="0.00", credit="0.00".
 
-        Return format:
-        {
-          "Transactions": [
-            {
-              "date": "DD-MM-YYYY",
-              "cheque_number": "cheque or ref no if any, else empty",
-              "narration": "description",
-              "debit": "0.00",
-              "credit": "0.00",
-              "balance": "0.00"
-            }
-          ]
-        }
-        """
+COLUMN READING RULES (CRITICAL — DO NOT MIX UP):
+1. The PDF has SEPARATE columns: Debit (money OUT) and Credit (money IN). Read each number from the column it physically appears in.
+2. A number in the DEBIT column → put it in "debit". A number in the CREDIT column → put it in "credit". NEVER put a credit-column number in the debit field.
+3. Most rows will have EITHER a debit amount OR a credit amount, not both. If only one column has a number, the other MUST be "0.00".
+4. If a single "Amount" column exists with a CR/DR suffix: CR suffix → credit field; DR suffix → debit field.
+5. Withdrawal / payment / debit card / UPI paid = debit. Deposit / salary / NEFT received / interest credited = credit.
+
+EXTRACTION RULES:
+1. Date format: DD-MM-YYYY
+2. Extract cheque_number or reference number from a dedicated column, or from within the narration text.
+3. Include opening balance as first row if present.
+4. Do NOT skip any transaction.
+5. If balance column is empty, calculate it from prev_balance and the debit/credit.
+
+SELF-VERIFICATION (mandatory before returning):
+For every row after the first: Previous_Balance - Debit + Credit MUST equal Current_Balance (within 1 rupee).
+If it does not match, YOU HAVE MISREAD AN AMOUNT — go back and re-read the PDF cell carefully before returning.
+
+Return ONLY valid JSON:
+{
+  "Transactions": [
+    {
+      "date": "DD-MM-YYYY",
+      "cheque_number": "cheque or ref no if any, else empty string",
+      "narration": "description",
+      "debit": "0.00",
+      "credit": "0.00",
+      "balance": "0.00"
+    }
+  ]
+}
+
+FINAL REMINDER: All debit, credit, balance = plain decimal strings with exactly 2 decimal places. No commas, no symbols. Triple-check every amount."""
         
         model = genai.GenerativeModel(
             'gemini-2.5-flash',
-            generation_config={"response_mime_type": "application/json"}
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.0,  # Zero temperature for maximum precision
+            }
         )
         
         response = model.generate_content([uploaded_file, prompt])
@@ -593,19 +625,19 @@ async def extract_statement_ai(
         result = json.loads(response.text)
         ai_transactions = result.get("Transactions", [])
         
-        # Convert to our format and reconcile
+        # Convert to our format — clean every amount through clean_amount()
         formatted_transactions = []
         for txn in ai_transactions:
             formatted_transactions.append({
                 "date": txn.get("date", ""),
                 "cheque_number": txn.get("cheque_number", ""),
                 "narration": txn.get("narration", ""),
-                "debit": str(txn.get("debit", "0.00")),
-                "credit": str(txn.get("credit", "0.00")),
-                "balance": str(txn.get("balance", "0.00"))
+                "debit": str(clean_amount(txn.get("debit", "0.00"))),
+                "credit": str(clean_amount(txn.get("credit", "0.00"))),
+                "balance": str(clean_amount(txn.get("balance", "0.00")))
             })
         
-        # 🔥 Apply balance reconciliation to AI output too!
+        # Apply balance reconciliation to catch and fix any remaining errors
         formatted_transactions = reconcile_and_fix_transactions(formatted_transactions)
         
     except Exception as e:

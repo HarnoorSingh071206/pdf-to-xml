@@ -3,8 +3,10 @@ import io
 import json
 import logging
 import time
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import tempfile
 
 from flask import Flask, render_template, request, send_file, flash, redirect
@@ -24,51 +26,122 @@ logger = logging.getLogger(__name__)
 # Configure Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
+# ─── Amount Cleaning — handles Indian lakh/crore formatting ─────────────────
+
+def clean_amount(raw) -> Decimal:
+    """
+    Convert any amount string to Decimal.
+    Handles Indian format (1,23,456.78), Western format (123,456.78),
+    currency symbols, accounting negatives, CR/DR markers.
+    """
+    if raw is None:
+        return Decimal('0.00')
+    
+    s = str(raw).strip()
+    if not s or s.lower() in ('none', 'null', 'nan', '', '-', '--', 'n/a'):
+        return Decimal('0.00')
+    
+    # Remove currency symbols, whitespace, newlines
+    s = re.sub(r'[₹$£€\s\n\r\t]', '', s)
+    
+    # Remove trailing CR/DR markers
+    s = re.sub(r'(?i)\s*(cr|dr)\s*$', '', s)
+    
+    # Handle accounting negative notation (1,234.56)
+    is_negative = False
+    if s.startswith('(') and s.endswith(')'):
+        is_negative = True
+        s = s[1:-1]
+    if s.startswith('-'):
+        is_negative = True
+        s = s[1:]
+    
+    # Remove all commas (handles both Indian 1,23,456.78 and Western 123,456.78)
+    s = s.replace(',', '')
+    
+    # Remove any remaining non-numeric chars except dot
+    s = re.sub(r'[^\d.]', '', s)
+    
+    # Handle multiple dots (keep only the last one as decimal)
+    if s.count('.') > 1:
+        parts = s.split('.')
+        s = ''.join(parts[:-1]) + '.' + parts[-1]
+    
+    if not s or s == '.':
+        return Decimal('0.00')
+    
+    try:
+        result = Decimal(s)
+        if is_negative:
+            result = -result
+        return result
+    except (InvalidOperation, ValueError):
+        return Decimal('0.00')
+
+
 # ─── LLM Interaction Logic (Gemini) ──────────────────────────────────────────
 
 def get_gemini_parsing(file_path):
-    """Uploads the PDF to Gemini and expects JSON output."""
-    prompt = """
-    You are a professional bank statement parser. Analyze the attached PDF bank statement.
-    Extract ALL transaction data and account information into a structured JSON format.
+    """Uploads the PDF to Gemini and expects JSON output with exact amounts."""
+    
+    prompt = """You are an expert Indian bank statement parser. Analyze the attached PDF bank statement with EXTREME PRECISION on all monetary amounts.
 
-    REQUIREMENTS:
-    1. Extract account details: BankName, AccountNumber, AccountHolder, StatementPeriod, AccountType.
-    2. Extract EVERY SINGLE transaction: Date, Description, Debit, Credit, Balance, TransactionType.
-    3. If Debit or Credit is missing or empty, use 0.0. Do not put null.
-    4. Carefully distinguish Debits and Credits based on their columns.
-    5. Do NOT skip any transactions. Be exhaustive and 100% accurate.
-    6. Ensure that if "Opening Balance" exists, it is also logged as the first transaction.
-    7. Return ONLY a valid JSON object matching the schema below.
+CRITICAL RULES FOR AMOUNTS:
+1. Indian bank statements use the Indian numbering system: 1,23,456.78 means ONE LAKH TWENTY-THREE THOUSAND = 123456.78 as a plain number. The LAST decimal group after the final dot is paise.
+2. EXACT DECIMAL RULE: "2,12,542.14" → 212542.14. "1,15,935.00" → 115935.00. NEVER drop or shift the decimal point.
+3. A number like "2,12,542" has NO decimal — it is 212542.00. Add ".00" yourself.
+4. ZERO-INFLATION RULE: if your extracted balance is 10× or 100× larger than neighbouring balances, you have misread a comma as a decimal — go back and re-read.
+5. EVERY amount MUST be returned as a plain decimal STRING with exactly 2 decimal places: "115935.00", "2008.28". No commas, no ₹ symbol.
+6. If an amount cell is blank or has a dash (-), return "0.00".
+7. Opening Balance row: Debit="0.00", Credit="0.00".
 
-    JSON SCHEMA:
+COLUMN READING RULES (CRITICAL — DO NOT MIX UP):
+1. The PDF has SEPARATE columns: Debit (money OUT) and Credit (money IN). Read each number from the column it physically appears in.
+2. A number in the DEBIT column → put it in "Debit". A number in the CREDIT column → put it in "Credit". NEVER put a credit-column number in the Debit field.
+3. Most rows will have EITHER a Debit amount OR a Credit amount, not both. If only one column has a number, the other MUST be "0.00".
+4. If a single "Amount" column exists with a CR/DR suffix: CR suffix → Credit field; DR suffix → Debit field.
+5. Withdrawal / payment / debit card / UPI paid = Debit. Deposit / salary / NEFT received / interest credited = Credit.
+
+EXTRACTION RULES:
+1. Extract account details: BankName, AccountNumber, AccountHolder, StatementPeriod, AccountType.
+2. Extract EVERY SINGLE transaction row — do NOT skip any.
+3. Include Opening Balance as the first transaction if present.
+4. Keep the original date string from the PDF.
+5. Merge multi-line transaction descriptions into one Description string.
+
+SELF-VERIFICATION (mandatory before returning):
+For every row after the first: Previous_Balance - Debit + Credit MUST equal Current_Balance (within 1 rupee).
+If it does not match, YOU HAVE MISREAD AN AMOUNT — go back and re-read the PDF cell carefully before returning.
+
+Return ONLY a valid JSON object with this EXACT schema:
+{
+  "AccountInfo": {
+    "BankName": "",
+    "AccountNumber": "",
+    "AccountHolder": "",
+    "StatementPeriod": "",
+    "AccountType": ""
+  },
+  "Transactions": [
     {
-      "AccountInfo": {
-        "BankName": "",
-        "AccountNumber": "",
-        "AccountHolder": "",
-        "StatementPeriod": "",
-        "AccountType": ""
-      },
-      "Transactions": [
-        {
-          "Date": "",
-          "Description": "",
-          "Debit": 0.0,
-          "Credit": 0.0,
-          "Balance": 0.0,
-          "TransactionType": ""
-        }
-      ]
+      "Date": "",
+      "Description": "",
+      "Debit": "0.00",
+      "Credit": "0.00",
+      "Balance": "0.00",
+      "TransactionType": ""
     }
-    """
+  ]
+}
+
+FINAL REMINDER: All Debit, Credit, Balance = plain decimal strings with exactly 2 decimal places. No commas, no symbols. Triple-check every amount."""
     
     try:
         logger.info("Uploading file to Google Gemini API...")
         uploaded_file = genai.upload_file(path=file_path)
         
         # Wait for the file to be processed
-        timeout = 60
+        timeout = 120
         start_time = time.time()
         while uploaded_file.state.name == "PROCESSING":
             if time.time() - start_time > timeout:
@@ -85,7 +158,10 @@ def get_gemini_parsing(file_path):
         logger.info("File uploaded. Generating content...")
         model = genai.GenerativeModel(
             'gemini-2.5-flash',
-            generation_config={"response_mime_type": "application/json"}
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.0,  # Zero temperature for maximum precision
+            }
         )
         
         response = model.generate_content([uploaded_file, prompt])
@@ -98,6 +174,117 @@ def get_gemini_parsing(file_path):
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
         return None
+
+
+# ─── Post-Processing: Validate & Fix Amounts ─────────────────────────────────
+
+def validate_and_fix_transactions(transactions):
+    """
+    Post-process Gemini output to ensure amount accuracy.
+    Strategy (in priority order):
+      1. If debit/credit are swapped → swap them.
+      2. If only one of debit/credit is non-zero and reclassifying it fixes balance → reclassify.
+      3. AUTHORITATIVE FALLBACK: derive debit/credit from the balance delta.
+         balance_delta = curr_bal - prev_bal
+         If delta < 0  → it was a debit  (money went OUT)
+         If delta >= 0 → it was a credit (money came IN)
+    """
+    if not transactions:
+        return transactions
+    
+    fixed = []
+    errors = 0
+    
+    for i, txn in enumerate(transactions):
+        # Clean all amounts through our robust parser first
+        txn['Debit'] = str(clean_amount(txn.get('Debit', '0.00')))
+        txn['Credit'] = str(clean_amount(txn.get('Credit', '0.00')))
+        txn['Balance'] = str(clean_amount(txn.get('Balance', '0.00')))
+        
+        if i == 0:
+            fixed.append(txn)
+            continue
+        
+        prev_bal = clean_amount(fixed[-1].get('Balance', '0'))
+        curr_bal = clean_amount(txn.get('Balance', '0'))
+        debit = clean_amount(txn.get('Debit', '0'))
+        credit = clean_amount(txn.get('Credit', '0'))
+        
+        expected = prev_bal - debit + credit
+        diff = abs(expected - curr_bal)
+        
+        if diff <= Decimal('0.02'):
+            # ✅ Math checks out — keep as-is
+            fixed.append(txn)
+            continue
+        
+        errors += 1
+        logger.warning(
+            f"Row {i+1} BALANCE MISMATCH: "
+            f"prev={prev_bal} debit={debit} credit={credit} → expected={expected}, "
+            f"got balance={curr_bal} (diff={diff})"
+        )
+        
+        fixed_this_row = False
+        
+        # FIX #1: Debit and credit are swapped
+        swapped = prev_bal - credit + debit
+        if abs(swapped - curr_bal) <= Decimal('0.02'):
+            logger.info(f"  → FIX #1 applied: swapped debit/credit")
+            txn['Debit'], txn['Credit'] = str(credit), str(debit)
+            fixed_this_row = True
+        
+        # FIX #2a: Reclassify debit-only as credit
+        elif debit > 0 and credit == Decimal('0.00'):
+            if abs((prev_bal + debit) - curr_bal) <= Decimal('0.02'):
+                logger.info(f"  → FIX #2a applied: debit→credit (was credit all along)")
+                txn['Credit'] = str(debit)
+                txn['Debit'] = '0.00'
+                fixed_this_row = True
+        
+        # FIX #2b: Reclassify credit-only as debit
+        elif credit > 0 and debit == Decimal('0.00'):
+            if abs((prev_bal - credit) - curr_bal) <= Decimal('0.02'):
+                logger.info(f"  → FIX #2b applied: credit→debit (was debit all along)")
+                txn['Debit'] = str(credit)
+                txn['Credit'] = '0.00'
+                fixed_this_row = True
+        
+        # FIX #3 (AUTHORITATIVE FALLBACK): Derive debit/credit from balance delta.
+        # The balance column is a single number — much less likely to be hallucinated
+        # than the separate debit/credit columns. Trust it and re-derive.
+        if not fixed_this_row:
+            balance_delta = curr_bal - prev_bal  # negative = money out, positive = money in
+            if balance_delta < Decimal('0.00'):
+                correct_debit = abs(balance_delta)
+                logger.info(
+                    f"  → FIX #3 applied: balance delta {balance_delta} → "
+                    f"debit={correct_debit} (was debit={debit}, credit={credit})"
+                )
+                txn['Debit'] = str(correct_debit)
+                txn['Credit'] = '0.00'
+            elif balance_delta > Decimal('0.00'):
+                correct_credit = balance_delta
+                logger.info(
+                    f"  → FIX #3 applied: balance delta +{balance_delta} → "
+                    f"credit={correct_credit} (was debit={debit}, credit={credit})"
+                )
+                txn['Credit'] = str(correct_credit)
+                txn['Debit'] = '0.00'
+            else:
+                logger.info(f"  → FIX #3 applied: zero delta → both debit and credit set to 0.00")
+                txn['Debit'] = '0.00'
+                txn['Credit'] = '0.00'
+        
+        fixed.append(txn)
+    
+    if errors > 0:
+        logger.warning(f"Total balance mismatches corrected: {errors}")
+    else:
+        logger.info("✅ All balances verified correctly — zero mismatches!")
+    
+    return fixed
+
 
 # ─── PDF Processing ─────────────────────────────────────────────────────────
 
@@ -118,22 +305,34 @@ def process_pdf(file_bytes):
     account_info = result.get("AccountInfo", {})
     all_transactions = result.get("Transactions", [])
 
-    logger.info(f"Total transactions found: {len(all_transactions)}")
+    logger.info(f"Raw transactions from Gemini: {len(all_transactions)}")
 
-    # Deduplicate transactions (just in case)
+    # Deduplicate transactions
     seen = set()
     unique_txns = []
     for t in all_transactions:
-        key = f"{t.get('Date')}-{t.get('Description')}-{t.get('Debit')}-{t.get('Credit')}"
+        key = (
+            t.get('Date', ''),
+            t.get('Description', '')[:50],
+            str(clean_amount(t.get('Debit', '0'))),
+            str(clean_amount(t.get('Credit', '0'))),
+            str(clean_amount(t.get('Balance', '0'))),
+        )
         if key not in seen:
             seen.add(key)
             unique_txns.append(t)
+    
+    logger.info(f"After dedup: {len(unique_txns)} unique transactions")
+    
+    # Validate and fix amounts using balance chain math
+    unique_txns = validate_and_fix_transactions(unique_txns)
             
     return account_info, unique_txns
 
 # ─── XML Generation ─────────────────────────────────────────────────────────
 
 def generate_xml(account_info, transactions):
+    """Generate clean XML output with proper decimal formatting."""
     root = ET.Element("BankStatement")
     
     # AccountInfo
@@ -143,17 +342,26 @@ def generate_xml(account_info, transactions):
         
     # Transactions
     txns_el = ET.SubElement(root, "Transactions")
-    total_debits = 0.0
-    total_credits = 0.0
+    total_debits = Decimal('0.00')
+    total_credits = Decimal('0.00')
     
     for i, t in enumerate(transactions, 1):
         txn_el = ET.SubElement(txns_el, "Transaction", id=str(i))
         for k, v in t.items():
-            ET.SubElement(txn_el, k).text = str(v)
-            try:
-                if k == "Debit": total_debits += float(v or 0)
-                if k == "Credit": total_credits += float(v or 0)
-            except: pass
+            # Sanitize XML tag names
+            tag = re.sub(r'[^a-zA-Z0-9_]', '', k)
+            if not tag:
+                continue
+            
+            if k in ('Debit', 'Credit', 'Balance'):
+                amount = clean_amount(v)
+                ET.SubElement(txn_el, tag).text = f"{amount:.2f}"
+                if k == 'Debit':
+                    total_debits += amount
+                elif k == 'Credit':
+                    total_credits += amount
+            else:
+                ET.SubElement(txn_el, tag).text = str(v) if v else ""
             
     # Summary
     summary_el = ET.SubElement(root, "Summary")
