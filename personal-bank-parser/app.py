@@ -9,9 +9,12 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import tempfile
 
+from typing import List
 from flask import Flask, render_template, request, send_file, flash, redirect
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from google import genai
+from google.genai import types
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +28,51 @@ logger = logging.getLogger(__name__)
 
 # Configure Gemini
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# ─── Pydantic Schemas for Structured Output ──────────────────────────────────
+
+class AccountInfoSchema(BaseModel):
+    BankName: str = Field(default="", description="Name of the bank")
+    AccountNumber: str = Field(default="", description="Account number")
+    AccountHolder: str = Field(default="", description="Account holder name")
+    StatementPeriod: str = Field(default="", description="Date range of statement")
+    AccountType: str = Field(default="", description="Savings, Current, etc.")
+
+class TransactionSchema(BaseModel):
+    Date: str = Field(description="Transaction date string from document")
+    Description: str = Field(description="Narrative or particulars of transaction")
+    Debit: str = Field(default="0.00", description="Withdrawal / money out as plain decimal string (e.g. 1500.00)")
+    Credit: str = Field(default="0.00", description="Deposit / money in as plain decimal string (e.g. 0.00)")
+    Balance: str = Field(default="0.00", description="Closing balance as plain decimal string")
+    TransactionType: str = Field(default="", description="'debit', 'credit', or 'opening'")
+
+class StatementOutputSchema(BaseModel):
+    AccountInfo: AccountInfoSchema
+    Transactions: List[TransactionSchema]
+
+SYSTEM_INSTRUCTION = """You are an expert Indian bank statement parser. Analyze the attached PDF bank statement with EXTREME PRECISION on all monetary amounts.
+
+=== DECIMAL vs COMMA ===
+In Indian number formatting:
+  - COMMA (,) is a THOUSANDS SEPARATOR. It has ZERO effect on numeric value.
+  - PERIOD (.) is the DECIMAL point.
+  - "1,23,456.78" → 123456.78
+  - NEVER treat a comma as a decimal point. "12,542" is twelve-thousand-five-hundred-forty-two (12542.00).
+
+CRITICAL RULES FOR AMOUNTS:
+1. "2,12,542.14" → 212542.14. Never drop or shift the decimal point.
+2. Return amounts as plain decimal strings with 2 decimal places: "115935.00". No commas, no ₹ symbol.
+3. Blank/dash cells = "0.00".
+
+=== DEBIT vs CREDIT ===
+- DEBIT column = money going OUT (withdrawals, payments, UPI paid, charges).
+- CREDIT column = money coming IN (salary, deposits, NEFT received, refunds).
+- Read each number from its physical column. Do NOT swap columns.
+
+=== COMPLETENESS ===
+1. Scan the entire PDF from start to end.
+2. Extract every single row. Merge multi-line descriptions into one string.
+"""
 
 # ─── Amount Cleaning — handles Indian lakh/crore formatting ─────────────────
 
@@ -83,75 +131,6 @@ def clean_amount(raw) -> Decimal:
 
 def get_gemini_parsing(file_path):
     """Uploads the PDF to Gemini and expects JSON output with exact amounts."""
-    
-    prompt = """You are an expert Indian bank statement parser. Analyze the attached PDF bank statement with EXTREME PRECISION on all monetary amounts.
-
-=== DECIMAL vs COMMA — THE MOST CRITICAL RULE ===
-In Indian number formatting:
-  - COMMA (,) is a THOUSANDS SEPARATOR. It has ZERO effect on the numeric value.
-  - PERIOD (.) is the DECIMAL point. Only the digits AFTER the LAST period are paise (cents).
-  - Example: "1,23,456.78" → the value is ONE LAKH TWENTY-THREE THOUSAND FOUR HUNDRED FIFTY-SIX and 78 paise = 123456.78
-  - NEVER treat a comma as a decimal point. "12,542" is twelve-thousand-five-hundred-forty-two (12542.00), NOT 12.542.
-  - NEVER split a number at a comma. "2,12,542.14" is a SINGLE number: 212542.14
-
-CRITICAL RULES FOR AMOUNTS:
-1. EXACT DECIMAL RULE: "2,12,542.14" → 212542.14. "1,15,935.00" → 115935.00. NEVER drop or shift the decimal point.
-2. A number like "2,12,542" has NO decimal — it is 212542.00. You must add ".00".
-3. ZERO-INFLATION RULE: if your extracted balance is 10× or 100× larger than neighbouring balances, you have misread a comma as a decimal — go back and re-read.
-4. EVERY amount MUST be returned as a plain decimal STRING with exactly 2 decimal places: "115935.00", "2008.28". No commas, no ₹ symbol.
-5. If an amount cell is blank or has a dash (-), return "0.00".
-6. Opening Balance row: Debit="0.00", Credit="0.00".
-
-=== DEBIT vs CREDIT — DO NOT SWAP ===
-- DEBIT column = money going OUT of the account (withdrawals, payments, UPI paid, EMI, charges).
-- CREDIT column = money coming INTO the account (salary, deposits, NEFT received, interest credited, refunds).
-- READ each number from the PHYSICAL COLUMN it appears in the PDF table.
-- A number in the DEBIT column → "Debit" field. A number in the CREDIT column → "Credit" field.
-- Most rows will have EITHER Debit OR Credit, not both. The other field MUST be "0.00".
-- If a single "Amount" column exists with CR/DR suffix: "CR" → Credit field; "DR" → Debit field.
-- NEVER put a credit-column number in the Debit field, or vice versa.
-
-=== COMPLETENESS — DO NOT MISS ANY ROW ===
-1. Scan the ENTIRE PDF from page 1 to the last page.
-2. Extract EVERY SINGLE transaction row — even if descriptions span multiple lines.
-3. Include the Opening Balance row as the first entry.
-4. Multi-line descriptions must be merged into one Description string.
-5. Do NOT skip any row, even if amounts seem small or descriptions are long.
-
-EXTRACTION RULES:
-1. Extract account details: BankName, AccountNumber, AccountHolder, StatementPeriod, AccountType.
-2. Keep the original date string from the PDF as-is.
-3. TransactionType: "debit" if money went out, "credit" if money came in, "opening" for opening balance.
-
-SELF-VERIFICATION (mandatory before returning):
-For every row after the first:
-  Previous_Balance - Debit + Credit MUST equal Current_Balance (tolerance: 1 rupee).
-If it does NOT match, you have misread a comma as decimal OR swapped debit/credit.
-Go back, re-read the EXACT cell value from the PDF, and correct it before returning.
-
-Return ONLY a valid JSON object with this EXACT schema — no markdown, no code block, just JSON:
-{
-  "AccountInfo": {
-    "BankName": "",
-    "AccountNumber": "",
-    "AccountHolder": "",
-    "StatementPeriod": "",
-    "AccountType": ""
-  },
-  "Transactions": [
-    {
-      "Date": "",
-      "Description": "",
-      "Debit": "0.00",
-      "Credit": "0.00",
-      "Balance": "0.00",
-      "TransactionType": ""
-    }
-  ]
-}
-
-FINAL REMINDER: All Debit, Credit, Balance = plain decimal strings, exactly 2 decimal places, no commas, no ₹ symbol. Triple-check every single amount."""
-    
     try:
         logger.info("Uploading file to Google Gemini API...")
         uploaded_file = client.files.upload(file=file_path)
@@ -163,7 +142,6 @@ FINAL REMINDER: All Debit, Credit, Balance = plain decimal strings, exactly 2 de
             if time.time() - start_time > timeout:
                 logger.error("Gemini file processing timeout.")
                 return None
-            logger.info("Waiting for PDF to be processed by Gemini...")
             time.sleep(2)
             uploaded_file = client.files.get(name=uploaded_file.name)
             
@@ -174,16 +152,16 @@ FINAL REMINDER: All Debit, Credit, Balance = plain decimal strings, exactly 2 de
         logger.info("File uploaded. Generating content with gemini-3.1-pro-preview...")
         response = client.models.generate_content(
             model='gemini-3.1-pro-preview',
-            contents=[uploaded_file, prompt],
-            config={
-                "response_mime_type": "application/json",
-                "temperature": 0.0,
-            }
+            contents=[uploaded_file, "Extract all account info and transactions."],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=StatementOutputSchema,
+                temperature=0.0,
+            )
         )
         
-        # Clean up the file from Google's servers
         client.files.delete(name=uploaded_file.name)
-        
         return json.loads(response.text)
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
