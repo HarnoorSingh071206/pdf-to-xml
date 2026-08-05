@@ -1,6 +1,6 @@
 flask
 pdfplumber
-google-generativeai
+google-genai
 python-dotenv
 requests
 pytesseract

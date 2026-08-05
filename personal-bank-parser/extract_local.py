@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 # Load environment variables
 load_dotenv()
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configure Gemini
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ============================================================
 # AMOUNT CLEANING — handles Indian lakh/crore formatting
@@ -89,34 +89,50 @@ def get_gemini_parsing(file_path):
     
     prompt = """You are an expert Indian bank statement parser. Analyze the attached PDF bank statement with EXTREME PRECISION on all monetary amounts.
 
-CRITICAL RULES FOR AMOUNTS:
-1. Indian bank statements use the Indian numbering system: 1,23,456.78 means ONE LAKH TWENTY-THREE THOUSAND = 123456.78 as a plain number. The LAST decimal group after the final dot is paise.
-2. EXACT DECIMAL RULE: "2,12,542.14" → 212542.14. "1,15,935.00" → 115935.00. NEVER drop or shift the decimal point.
-3. A number like "2,12,542" has NO decimal — it is 212542.00. Add ".00" yourself.
-4. ZERO-INFLATION RULE: if your extracted balance is 10× or 100× larger than neighbouring balances, you have misread a comma as a decimal — go back and re-read.
-5. EVERY amount MUST be returned as a plain decimal STRING with exactly 2 decimal places: "115935.00", "2008.28". No commas, no ₹ symbol.
-6. If an amount cell is blank or has a dash (-), return "0.00".
-7. Opening Balance row: Debit="0.00", Credit="0.00".
+=== DECIMAL vs COMMA — THE MOST CRITICAL RULE ===
+In Indian number formatting:
+  - COMMA (,) is a THOUSANDS SEPARATOR. It has ZERO effect on the numeric value.
+  - PERIOD (.) is the DECIMAL point. Only the digits AFTER the LAST period are paise (cents).
+  - Example: "1,23,456.78" → the value is ONE LAKH TWENTY-THREE THOUSAND FOUR HUNDRED FIFTY-SIX and 78 paise = 123456.78
+  - NEVER treat a comma as a decimal point. "12,542" is twelve-thousand-five-hundred-forty-two (12542.00), NOT 12.542.
+  - NEVER split a number at a comma. "2,12,542.14" is a SINGLE number: 212542.14
 
-COLUMN READING RULES (CRITICAL — DO NOT MIX UP):
-1. The PDF has SEPARATE columns: Debit (money OUT) and Credit (money IN). Read each number from the column it physically appears in.
-2. A number in the DEBIT column → put it in "Debit". A number in the CREDIT column → put it in "Credit". NEVER put a credit-column number in the Debit field.
-3. Most rows will have EITHER a Debit amount OR a Credit amount, not both. If only one column has a number, the other MUST be "0.00".
-4. If a single "Amount" column exists with a CR/DR suffix: CR suffix → Credit field; DR suffix → Debit field.
-5. Withdrawal / payment / debit card / UPI paid = Debit. Deposit / salary / NEFT received / interest credited = Credit.
+CRITICAL RULES FOR AMOUNTS:
+1. EXACT DECIMAL RULE: "2,12,542.14" → 212542.14. "1,15,935.00" → 115935.00. NEVER drop or shift the decimal point.
+2. A number like "2,12,542" has NO decimal — it is 212542.00. You must add ".00".
+3. ZERO-INFLATION RULE: if your extracted balance is 10× or 100× larger than neighbouring balances, you have misread a comma as a decimal — go back and re-read.
+4. EVERY amount MUST be returned as a plain decimal STRING with exactly 2 decimal places: "115935.00", "2008.28". No commas, no ₹ symbol.
+5. If an amount cell is blank or has a dash (-), return "0.00".
+6. Opening Balance row: Debit="0.00", Credit="0.00".
+
+=== DEBIT vs CREDIT — DO NOT SWAP ===
+- DEBIT column = money going OUT of the account (withdrawals, payments, UPI paid, EMI, charges).
+- CREDIT column = money coming INTO the account (salary, deposits, NEFT received, interest credited, refunds).
+- READ each number from the PHYSICAL COLUMN it appears in the PDF table.
+- A number in the DEBIT column → "Debit" field. A number in the CREDIT column → "Credit" field.
+- Most rows will have EITHER Debit OR Credit, not both. The other field MUST be "0.00".
+- If a single "Amount" column exists with CR/DR suffix: "CR" → Credit field; "DR" → Debit field.
+- NEVER put a credit-column number in the Debit field, or vice versa.
+
+=== COMPLETENESS — DO NOT MISS ANY ROW ===
+1. Scan the ENTIRE PDF from page 1 to the last page.
+2. Extract EVERY SINGLE transaction row — even if descriptions span multiple lines.
+3. Include the Opening Balance row as the first entry.
+4. Multi-line descriptions must be merged into one Description string.
+5. Do NOT skip any row, even if amounts seem small or descriptions are long.
 
 EXTRACTION RULES:
 1. Extract account details: BankName, AccountNumber, AccountHolder, StatementPeriod, AccountType.
-2. Extract EVERY SINGLE transaction row — do NOT skip any.
-3. Include Opening Balance as the first transaction if present.
-4. Keep the original date string from the PDF.
-5. Merge multi-line transaction descriptions into one Description string.
+2. Keep the original date string from the PDF as-is.
+3. TransactionType: "debit" if money went out, "credit" if money came in, "opening" for opening balance.
 
 SELF-VERIFICATION (mandatory before returning):
-For every row after the first: Previous_Balance - Debit + Credit MUST equal Current_Balance (within 1 rupee).
-If it does not match, YOU HAVE MISREAD AN AMOUNT — go back and re-read the PDF cell carefully before returning.
+For every row after the first:
+  Previous_Balance - Debit + Credit MUST equal Current_Balance (tolerance: 1 rupee).
+If it does NOT match, you have misread a comma as decimal OR swapped debit/credit.
+Go back, re-read the EXACT cell value from the PDF, and correct it before returning.
 
-Return ONLY a valid JSON object with this EXACT schema:
+Return ONLY a valid JSON object with this EXACT schema — no markdown, no code block, just JSON:
 {
   "AccountInfo": {
     "BankName": "",
@@ -137,11 +153,11 @@ Return ONLY a valid JSON object with this EXACT schema:
   ]
 }
 
-FINAL REMINDER: All Debit, Credit, Balance = plain decimal strings with exactly 2 decimal places. No commas, no symbols. Triple-check every amount."""
+FINAL REMINDER: All Debit, Credit, Balance = plain decimal strings, exactly 2 decimal places, no commas, no ₹ symbol. Triple-check every single amount."""
     
     try:
         logger.info("Uploading file to Google Gemini API...")
-        uploaded_file = genai.upload_file(path=file_path)
+        uploaded_file = client.files.upload(file=file_path)
         
         timeout = 120
         start_time = time.time()
@@ -151,25 +167,24 @@ FINAL REMINDER: All Debit, Credit, Balance = plain decimal strings with exactly 
                 return None
             logger.info("Waiting for PDF to be processed by Gemini...")
             time.sleep(2)
-            uploaded_file = genai.get_file(uploaded_file.name)
+            uploaded_file = client.files.get(name=uploaded_file.name)
             
         if uploaded_file.state.name == "FAILED":
             logger.error("Gemini failed to process the PDF.")
             return None
 
-        logger.info("File uploaded. Generating content with gemini-2.5-flash...")
-        model = genai.GenerativeModel(
-            'gemini-2.5-flash',
-            generation_config={
+        logger.info("File uploaded. Generating content with gemini-3.1-pro-preview...")
+        response = client.models.generate_content(
+            model='gemini-3.1-pro-preview',
+            contents=[uploaded_file, prompt],
+            config={
                 "response_mime_type": "application/json",
-                "temperature": 0.0,  # Zero temperature for maximum precision
+                "temperature": 0.0,
             }
         )
         
-        response = model.generate_content([uploaded_file, prompt])
-        
         # Clean up the file from Google's servers
-        genai.delete_file(uploaded_file.name)
+        client.files.delete(name=uploaded_file.name)
         
         return json.loads(response.text)
     except Exception as e:

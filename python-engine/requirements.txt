@@ -3,7 +3,7 @@ uvicorn
 pdfplumber
 pikepdf
 python-multipart
-google-generativeai
+google-genai
 python-dotenv
 pytesseract
 pdf2image
