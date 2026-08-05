@@ -4,6 +4,7 @@ pdfplumber
 pikepdf
 python-multipart
 google-genai
+pydantic
 python-dotenv
 pytesseract
 pdf2image

@@ -160,6 +160,12 @@ export default function Home() {
     return c + b.padStart(2,"0") + a.padStart(2,"0");
   };
 
+  // Strip commas before parseFloat to handle Indian number formatting:
+  // parseFloat("1,23,456.78") === 1  ← BUG
+  // parseFloat(cleanNum("1,23,456.78")) === 123456.78  ← CORRECT
+  const cleanNum = (val: unknown): number =>
+    parseFloat(String(val).replace(/,/g, "").trim()) || 0;
+
   const downloadXML = () => {
     if (!transactions.length) return;
     const guid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -174,8 +180,8 @@ export default function Home() {
   <LEDGER NAME="${suspenseLedger}" ACTION="Create"><NAME.LIST><NAME>${suspenseLedger}</NAME></NAME.LIST><PARENT>Suspense Accounts</PARENT><ISBILLWISEON>No</ISBILLWISEON></LEDGER>`;
 
     transactions.forEach(txn => {
-      const debit = parseFloat(txn.debit) || 0;
-      const credit = parseFloat(txn.credit) || 0;
+      const debit = cleanNum(txn.debit);
+      const credit = cleanNum(txn.credit);
       const isReceipt = credit > 0;
       const amount = isReceipt ? credit : debit;
       if (!amount) return;
@@ -264,7 +270,7 @@ export default function Home() {
                   </div>
                   <div>
                     <p className="font-bold text-slate-900 text-sm">AI Powered Engine (Gemini)</p>
-                    <p className="text-slate-500 text-xs font-medium">Use Gemini 2.5 Flash for complex statement layouts</p>
+                    <p className="text-slate-500 text-xs font-medium">Use Gemini 3.1 pro for complex statement layouts</p>
                   </div>
                 </div>
                 <button 
